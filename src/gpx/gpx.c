@@ -2370,7 +2370,7 @@ static int pause_at_zpos(Gpx *gpx, float z_positon)
 
     // uint8: pause at Z coordinate or 0.0 to disable
     write_float(gpx, z_positon);
-
+        gcodeResult(gpx, "(line %u) Pause @ zPos %f" EOL, gpx->lineNumber ,z_positon);
     return end_frame(gpx);
 }
 
@@ -2576,7 +2576,7 @@ const char *get_firmware_variant(unsigned int variant_id)
 int load_eeprom_map(Gpx *gpx)
 {
     int rval = SUCCESS;
-    
+
     if(!gpx->flag.sioConnected || gpx->sio == NULL) {
         gcodeResult(gpx, "(line %u) Serial not connected: can't detect which eeprom map without asking the bot" EOL, gpx->lineNumber);
         return ERROR;
@@ -4892,7 +4892,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
             case 26:
                 // s3g doesn't have a set SD position
                 // looks like software uses the sequence M25\nM26 S0 to cancel
-                // the print so that the next M24 will start over 
+                // the print so that the next M24 will start over
                 VERBOSE( {if(gpx->command.flag & S_IS_SET && gpx->command.s > 0)
                     fprintf(gpx->log, "Only reset to sd position 0 is supported: M26 S0" EOL);} )
                 break;
