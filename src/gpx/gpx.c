@@ -34,15 +34,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdint.h>
+
 #include <libgen.h>
 
+#include "portable_endian.h"
 #include "gpx.h"
 
 #define A 0
 #define B 1
 
-#define SHOW(FN) if(gpx->flag.logMessages) {FN;}
-#define VERBOSE(FN) if(gpx->flag.verboseMode && gpx->flag.logMessages) {FN;}
 #define VERBOSESIO(FN) if(gpx->flag.verboseSioMode) {FN;}
 #define CALL(FN) if((rval = FN) != SUCCESS) return rval
 
@@ -58,8 +59,31 @@
 
 #undef MACHINE_ARRAY
 
+void short_sleep(long nsec)
+{
+#ifdef HAVE_NANOSLEEP
+    // some old mingw32 compiler, in particular the cross compiler still in use
+    // on MacOS, lack nanosleep
+    struct timespec ts = {0, nsec};
+    nanosleep(&ts, NULL);
+#else
+    usleep(nsec / 1000);
+#endif
+}
+
+void long_sleep(time_t sec)
+{
+#ifdef HAVE_NANOSLEEP
+    struct timespec ts = {sec, 0};
+    nanosleep(&ts, NULL);
+#else
+    usleep(sec * 1000);
+#endif
+}
+
+
 // send a result to the result handler or log it if there isn't one
-static int gcodeResult(Gpx *gpx, const char *fmt, ...)
+int gcodeResult(Gpx *gpx, const char *fmt, ...)
 {
     int result = 0;
     va_list args;
@@ -142,18 +166,22 @@ int gpx_set_machine(Gpx *gpx, const char *machine_type, int init)
         memcpy(&gpx->machine, machine, sizeof(Machine));
         VERBOSE( fprintf(gpx->log, "Loading machine definition: %s" EOL, machine->desc) );
         if(gpx->iniPath != NULL) {
-            // if there's a gpx->iniPath + "/" + machine->type + ".ini" load it
+            // if there's a gpx->iniPath + "/" + machine_type + ".ini" load it
             // here recursively
             char machineIni[1024];
             machineIni[0] = 0;
-            int i = snprintf(machineIni, sizeof(machineIni), "%s/%s.ini", gpx->iniPath, machine->type);
+            int i = snprintf(machineIni, sizeof(machineIni), "%s/%s.ini", gpx->iniPath, machine_type);
             if(i > 0 && i < sizeof(machineIni)) {
                 if(access(machineIni, R_OK) == SUCCESS) {
                     VERBOSE( fprintf(gpx->log, "Using custom machine definition from: %s" EOL, machineIni) );
                     ini_parse(gpx, machineIni, gpx_set_property);
                 }
-                else if(errno != ENOENT)
+                else if(errno != ENOENT) {
                     VERBOSE( fprintf(gpx->log, "Unable to load custom machine definition errno = %d\n", errno) );
+                }
+                else {
+                    VERBOSE( fprintf(gpx->log, "Unable to access: %s" EOL, machineIni) );
+                }
             }
         }
     }
@@ -175,11 +203,23 @@ static int pause_at_zpos(Gpx *gpx, float z_positon);
 
 // initialization of global variables
 
+// 02 - Get available buffer size
+char buffer_size_query[] = {
+    0xD5,   // start byte
+    1,      // length
+    2,      // query command
+    0       // crc
+};
+static unsigned char calculate_crc(unsigned char *addr, long len);
+
 void gpx_initialize(Gpx *gpx, int firstTime)
 {
     int i;
 
     if(!gpx) return;
+
+    // Delay to wait after opening a serial I/O connection
+    gpx->open_delay = 2;
 
     gpx->buffer.ptr = gpx->buffer.out;
     // we default to using pipes
@@ -334,6 +374,7 @@ void gpx_initialize(Gpx *gpx, int firstTime)
     if(firstTime) {
         gpx->flag.loadMacros = 1;
         gpx->flag.runMacros = 1;
+        gpx->flag.ignoreAbsoluteMoves = 0;
     }
 
     if(firstTime)
@@ -367,6 +408,9 @@ void gpx_initialize(Gpx *gpx, int firstTime)
     // LOGGING
 
     if(firstTime) gpx->log = stderr;
+
+    // CANNED COMMANDS
+    buffer_size_query[3] = calculate_crc((unsigned char *)buffer_size_query + 2, 1);
 }
 
 // PRINT STATE
@@ -389,52 +433,52 @@ static unsigned char read_8(Gpx *gpx)
     return *gpx->buffer.ptr++;
 }
 
-static void write_16(Gpx *gpx, unsigned short value)
+static void write_16(Gpx *gpx, uint16_t value)
 {
     union {
-        unsigned short s;
+        uint16_t s;
         unsigned char b[2];
     } u;
-    u.s = value;
+    u.s = htole16(value);
     *gpx->buffer.ptr++ = u.b[0];
     *gpx->buffer.ptr++ = u.b[1];
 }
 
-static unsigned short read_16(Gpx *gpx)
+static uint16_t read_16(Gpx *gpx)
 {
     union {
-        unsigned short s;
+        uint16_t s;
         unsigned char b[2];
     } u;
     u.b[0] = *gpx->buffer.ptr++;
     u.b[1] = *gpx->buffer.ptr++;
-    return u.s;
+    return le16toh(u.s);
 }
 
-static void write_32(Gpx *gpx, unsigned int value)
+static void write_32(Gpx *gpx, uint32_t value)
 {
     union {
-        unsigned int i;
+        uint32_t i;
         unsigned char b[4];
     } u;
-    u.i = value;
+    u.i = htole32(value);
     *gpx->buffer.ptr++ = u.b[0];
     *gpx->buffer.ptr++ = u.b[1];
     *gpx->buffer.ptr++ = u.b[2];
     *gpx->buffer.ptr++ = u.b[3];
 }
 
-static unsigned int read_32(Gpx *gpx)
+static uint32_t read_32(Gpx *gpx)
 {
     union {
-        unsigned int i;
+        uint32_t i;
         unsigned char b[4];
     } u;
     u.b[0] = *gpx->buffer.ptr++;
     u.b[1] = *gpx->buffer.ptr++;
     u.b[2] = *gpx->buffer.ptr++;
     u.b[3] = *gpx->buffer.ptr++;
-    return u.i;
+    return le32toh(u.i);
 }
 
 static void write_fixed_16(Gpx *gpx, float value)
@@ -457,9 +501,11 @@ static void write_float(Gpx *gpx, float value)
 {
     union {
         float f;
+        uint32_t i;
         unsigned char b[4];
     } u;
     u.f = value;
+    u.i = htole32(u.i);
     *gpx->buffer.ptr++ = u.b[0];
     *gpx->buffer.ptr++ = u.b[1];
     *gpx->buffer.ptr++ = u.b[2];
@@ -470,12 +516,14 @@ static float read_float(Gpx *gpx)
 {
     union {
         float f;
+        uint32_t i;
         unsigned char b[4];
     } u;
     u.b[0] = *gpx->buffer.ptr++;
     u.b[1] = *gpx->buffer.ptr++;
     u.b[2] = *gpx->buffer.ptr++;
     u.b[3] = *gpx->buffer.ptr++;
+    u.i = le32toh(u.i);
     return u.f;
 }
 
@@ -573,6 +621,15 @@ static int end_frame(Gpx *gpx)
     gpx->accumulated.bytes += length;
     if(gpx->callbackHandler) {
         return gpx->callbackHandler(gpx, gpx->callbackData, gpx->buffer.out, length);
+    }
+    return SUCCESS;
+}
+
+// no x3g to emit, but the callback might want to look at the parsed command
+static int empty_frame(Gpx *gpx)
+{
+    if(gpx->callbackHandler) {
+        return gpx->callbackHandler(gpx, gpx->callbackData, gpx->buffer.out, 0);
     }
     return SUCCESS;
 }
@@ -793,6 +850,24 @@ static Point5d delta_steps(Gpx *gpx,Point5d deltaMM)
     return deltaSteps;
 }
 
+static void set_unknown_axes(Gpx *gpx, int flag)
+{
+    gpx->axis.positionKnown &= ~(flag & gpx->axis.mask);
+
+    // we don't know where the bot is and most likely 0 is wrong
+    // but always setting it at least makes any errors very deterministic
+    if(flag & X_IS_SET)
+        gpx->current.position.x = 0;
+    if(flag & Y_IS_SET)
+        gpx->current.position.y = 0;
+    if(flag & Z_IS_SET)
+        gpx->current.position.z = 0;
+    if(flag & A_IS_SET)
+        gpx->current.position.a = 0;
+    if(flag & B_IS_SET)
+        gpx->current.position.b = 0;
+}
+
 // X3G QUERIES
 
 #define COMMAND_OFFSET 2
@@ -800,6 +875,7 @@ static Point5d delta_steps(Gpx *gpx,Point5d deltaMM)
 #define QUERY_COMMAND_OFFSET 4
 #define EEPROM_LENGTH_OFFSET 5
 
+#ifdef FUTURE
 // 00 - Get version
 
 static int get_version(Gpx *gpx)
@@ -836,13 +912,14 @@ static int get_buffer_size(Gpx *gpx)
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 // 03 - Clear buffer (same as 07 and 17)
 
 int clear_buffer(Gpx *gpx)
 {
     begin_frame(gpx);
-    gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+    set_unknown_axes(gpx, gpx->axis.mask);
     gpx->excess.a = 0;
     gpx->excess.b = 0;
 
@@ -856,7 +933,7 @@ int clear_buffer(Gpx *gpx)
 int abort_immediately(Gpx *gpx)
 {
     begin_frame(gpx);
-    gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+    set_unknown_axes(gpx, gpx->axis.mask);
     gpx->excess.a = 0;
     gpx->excess.b = 0;
 
@@ -878,6 +955,7 @@ int pause_resume(Gpx *gpx)
 
 // 10 - Extruder Query Commands
 
+#ifdef FUTURE
 // Query 00 - Query firmware version information
 
 static int get_extruder_version(Gpx *gpx, unsigned extruder_id)
@@ -900,6 +978,7 @@ static int get_extruder_version(Gpx *gpx, unsigned extruder_id)
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 // Query 02 - Get extruder temperature
 
@@ -1021,6 +1100,7 @@ int is_build_platform_ready(Gpx *gpx, unsigned extruder_id)
     return end_frame(gpx);
 }
 
+#ifdef FUTURE
 // Query 36 - Get extruder status
 
 static int get_extruder_status(Gpx *gpx, unsigned extruder_id)
@@ -1060,6 +1140,7 @@ static int get_PID_state(Gpx *gpx, unsigned extruder_id)
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 // 11 - Is ready
 
@@ -1076,6 +1157,8 @@ int is_ready(Gpx *gpx)
 
 int read_eeprom(Gpx *gpx, unsigned address, unsigned length)
 {
+    SHOW( fprintf(gpx->log, "Reading EEPROM address %u length %u\n", address, length) );
+
     begin_frame(gpx);
 
     write_8(gpx, 12);
@@ -1093,6 +1176,8 @@ int read_eeprom(Gpx *gpx, unsigned address, unsigned length)
 
 int write_eeprom(Gpx *gpx, unsigned address, char *data, unsigned length)
 {
+    SHOW( fprintf(gpx->log, "Writing EEPROM address %u length %u\n", address, length) );
+
     begin_frame(gpx);
 
     write_8(gpx, 13);
@@ -1159,17 +1244,17 @@ static int select_filename(Gpx *gpx, char *filename)
     gpx->selectedFilename = strdup(filename);
     if(gpx->selectedFilename == NULL)
         return EOSERROR;
-    if(gpx->callbackHandler)
-        return gpx->callbackHandler(gpx, gpx->callbackData, gpx->buffer.out, 0);
+    empty_frame(gpx);
     return SUCCESS;
 }
 
+#ifdef FUTURE
 // 17 - Reset
 
 static int reset(Gpx *gpx)
 {
     begin_frame(gpx);
-    gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+    set_unknown_axes(gpx->axis.mask);
     gpx->excess.a = 0;
     gpx->excess.b = 0;
 
@@ -1177,6 +1262,7 @@ static int reset(Gpx *gpx)
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 // 18 - Get next filename
 
@@ -1192,6 +1278,7 @@ int get_next_filename(Gpx *gpx, unsigned restart)
     return end_frame(gpx);
 }
 
+#ifdef FUTURE
 // 20 - Get build name
 
 static int get_build_name(Gpx *gpx)
@@ -1202,6 +1289,7 @@ static int get_build_name(Gpx *gpx)
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 // 21 - Get extended position
 
@@ -1221,7 +1309,7 @@ int extended_stop(Gpx *gpx, unsigned halt_steppers, unsigned clear_queue)
     unsigned flag = 0;
     if(halt_steppers) flag |= 0x1;
     if(clear_queue) flag |= 0x2;
-    gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+    set_unknown_axes(gpx, gpx->axis.mask);
     gpx->excess.a = 0;
     gpx->excess.b = 0;
 
@@ -1920,6 +2008,7 @@ static int set_beep(Gpx *gpx, unsigned frequency, unsigned milliseconds)
 #define RESET_ON_TIMEOUT 0x02   // reset on timeout
 #define CLEAR_ON_PRESS  0x04    // clear screen on button press
 
+#ifdef FUTURE
 static int wait_for_button(Gpx *gpx, int button, unsigned timeout, int button_options)
 {
     begin_frame(gpx);
@@ -1937,6 +2026,7 @@ static int wait_for_button(Gpx *gpx, int button, unsigned timeout, int button_op
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 // 149 - Display message to LCD
 
@@ -2035,6 +2125,7 @@ static int queue_song(Gpx *gpx, unsigned song_id)
     return end_frame(gpx);
 }
 
+#ifdef FUTURE
 // 152 - Reset to factory defaults
 
 static int factory_defaults(Gpx *gpx)
@@ -2048,6 +2139,7 @@ static int factory_defaults(Gpx *gpx)
 
     return end_frame(gpx);
 }
+#endif // FUTURE
 
 
 // 153 - Build start notification
@@ -2071,7 +2163,7 @@ static int start_build(Gpx *gpx, const char * filename)
     // (But the LCD actually has far less room)
     // We'll just truncate at 24
     if(!filename)
-	 filename = "GPX" GPX_VERSION;
+	 filename = PACKAGE_STRING;
     len = strlen(filename);
     if(len > 24) len = 24;
     write_string(gpx, filename, len);
@@ -2249,7 +2341,7 @@ static int queue_ext_point(Gpx *gpx, double feedrate, Ptr5d delta, int relative)
         Point5d steps = mm_to_steps(gpx, &target, &gpx->excess);
 
 	// Total time required for the motion in units of microseconds
-        double usec = (60000000.0 * minutes);
+        double usec = (60000000.0L * minutes);
 
 	// Time interval between steps along the axis with the highest step count
 	//   total-time / highest-step-count
@@ -2258,7 +2350,7 @@ static int queue_ext_point(Gpx *gpx, double feedrate, Ptr5d delta, int relative)
 
         // Convert dda_interval into dda_rate (dda steps per second on the longest axis)
 	// steps-per-microsecond * 1000000 us/s = 1000000 * (1 / dda_interval)
-        double dda_rate = 1000000.0 / dda_interval;
+        double dda_rate = 1000000.0L / dda_interval;
 
         gpx->accumulated.time += (minutes * 60) * ACCELERATION_TIME;
 
@@ -2312,6 +2404,7 @@ static int set_acceleration(Gpx *gpx, int state)
     return end_frame(gpx);
 }
 
+#ifdef FUTURE
 // 157 - Stream Version
 
 static int stream_version(Gpx *gpx)
@@ -2359,6 +2452,7 @@ static int stream_version(Gpx *gpx)
     }
     return SUCCESS;
 }
+#endif // FUTURE
 
 // 158 - Pause @ zPos
 
@@ -2438,6 +2532,7 @@ static int add_command_at(Gpx *gpx, double z, char *filament_id, unsigned nozzle
                 gpx->commandAt[i].nozzle_temperature = nozzle_temperature;
                 gpx->commandAt[i].build_platform_temperature = build_platform_temperature;
                 gpx->commandAtZ = gpx->commandAt[gpx->commandAtLength].z;
+                VERBOSE( gcodeResult(gpx, "Inserted index=%d ", i) );
             }
             // append command
             else {
@@ -2446,12 +2541,21 @@ static int add_command_at(Gpx *gpx, double z, char *filament_id, unsigned nozzle
                 gpx->commandAt[i].nozzle_temperature = nozzle_temperature;
                 gpx->commandAt[i].build_platform_temperature = build_platform_temperature;
                 gpx->commandAtZ = z;
+                VERBOSE( gcodeResult(gpx, "Appended index=%d ", i) );
+            }
+            if(gpx->flag.verboseMode && gpx->flag.logMessages) {
+                gcodeResult(gpx, "Command @ %0.2lf: ", z);
+                if(nozzle_temperature == 0 && build_platform_temperature == 0)
+                    gcodeResult(gpx, "Pause\n");
+                else
+                    gcodeResult(gpx, "Set temperature; nozzle=%u, bed=%u\n", nozzle_temperature, build_platform_temperature);
             }
             // nonzero temperature signals a temperature change, not a pause @ zPos
             // so if its the first pause @ zPos que it up
             if(nozzle_temperature == 0 && build_platform_temperature == 0 && gpx->commandAtLength == 0) {
                 if(gpx->flag.macrosEnabled) {
                     CALL( pause_at_zpos(gpx, z) );
+                    VERBOSE( gcodeResult(gpx, "Sent pause @ %0.2lf\n", z) );
                 }
                 else {
                     gpx->flag.pausePending = 1;
@@ -2572,16 +2676,14 @@ const char *get_firmware_variant(unsigned int variant_id)
     return variant;
 }
 
-// load a built-in eeprom map based on the firmware variant and version
-int load_eeprom_map(Gpx *gpx)
+// find a built-in eeprom map based on the firmware variant and version
+EepromMap *find_eeprom_map(Gpx *gpx)
 {
-    int rval = SUCCESS;
-
-    if(!gpx->flag.sioConnected || gpx->sio == NULL) {
-        gcodeResult(gpx, "(line %u) Serial not connected: can't detect which eeprom map without asking the bot" EOL, gpx->lineNumber);
-        return ERROR;
+    int rval = get_advanced_version_number(gpx);
+    if(rval != SUCCESS) {
+        gcodeResult(gpx, "(line %u) Unable to load eeprom map: bot didn't reply to version number query: %d.\n", gpx->lineNumber, rval);
+        return NULL;
     }
-    CALL( get_advanced_version_number(gpx) );
 
     int i;
     EepromMap *pem = eepromMaps;
@@ -2589,15 +2691,42 @@ int load_eeprom_map(Gpx *gpx)
         if(gpx->sio->response.firmware.variant == pem->variant &&
                 gpx->sio->response.firmware.version >= pem->versionMin &&
                 gpx->sio->response.firmware.version <= pem->versionMax) {
-            gpx->eepromMap = pem;
-            gcodeResult(gpx, "EEPROM map loaded for firmware %s version %d.\n", get_firmware_variant(pem->variant), gpx->sio->response.firmware.version);
-            return SUCCESS;
+            return pem;
         }
     }
+    return NULL;
+}
+
+// load a built-in eeprom map based on the firmware variant and version
+int load_eeprom_map(Gpx *gpx)
+{
+    if(!gpx->flag.sioConnected || gpx->sio == NULL) {
+        gcodeResult(gpx, "(line %u) Serial not connected: can't detect which eeprom map without asking the bot" EOL, gpx->lineNumber);
+        return ERROR;
+    }
+
+    EepromMap *pem = find_eeprom_map(gpx);
+    if(pem != NULL) {
+        gpx->eepromMap = pem;
+        gcodeResult(gpx, "EEPROM map loaded for firmware %s version %d.\n", get_firmware_variant(pem->variant), gpx->sio->response.firmware.version);
+        return SUCCESS;
+    }
+
     gcodeResult(gpx, "(line %u) Unable to find a matching eeprom map for firmware %s version = %u\n",
             gpx->lineNumber, get_firmware_variant(gpx->sio->response.firmware.variant),
             gpx->sio->response.firmware.version);
     return ERROR;
+}
+
+static int find_in_eeprom_map(EepromMap *map, char *name)
+{
+    EepromMapping *pem = map->eepromMappings;
+    int iem;
+    for(iem = 0; iem < map->eepromMappingCount; iem++, pem++) {
+        if(strcmp(name, pem->id) == 0)
+            return iem;
+    }
+    return -1;
 }
 
 // find an eeprom mapping entry from the builtin mapping table
@@ -2606,13 +2735,7 @@ static int find_builtin_eeprom_mapping(Gpx *gpx, char *name)
     if(gpx->eepromMap == NULL)
         return -1;
 
-    int iem;
-    EepromMapping *pem = gpx->eepromMap->eepromMappings;
-    for(iem = 0; iem < gpx->eepromMap->eepromMappingCount; iem++, pem++) {
-        if(strcmp(name, pem->id) == 0)
-            return iem;
-    }
-    return -1;
+    return find_in_eeprom_map(gpx->eepromMap, name);
 }
 
 // find an existing EEPROM mapping
@@ -2850,7 +2973,7 @@ static int write_eeprom_name(Gpx *gpx, char *name, char *string_value, unsigned 
 
 static int display_tag(Gpx *gpx) {
     int rval;
-    CALL( display_message(gpx, "GPX " GPX_VERSION, 0, 0, 2, 0) );
+    CALL( display_message(gpx, PACKAGE_STRING, 0, 0, 2, 0) );
     return SUCCESS;
 }
 
@@ -2887,7 +3010,7 @@ static int calculate_target_position(Gpx *gpx, Ptr5d delta, int *relative)
         if(gpx->flag.relativeCoordinates) {
             delta->x = gpx->command.x * userScale;
             gpx->target.position.x += delta->x;
-            *relative = !!(gpx->axis.positionKnown & X_IS_SET);
+            *relative |= !!(gpx->axis.positionKnown & X_IS_SET);
         }
         else {
             gpx->target.position.x = (gpx->command.x + userOffset.x) * userScale;
@@ -2901,7 +3024,7 @@ static int calculate_target_position(Gpx *gpx, Ptr5d delta, int *relative)
         if(gpx->flag.relativeCoordinates) {
             delta->y = gpx->command.y * userScale;
             gpx->target.position.y += delta->y;
-            *relative = !!(gpx->axis.positionKnown & Y_IS_SET);
+            *relative |= !!(gpx->axis.positionKnown & Y_IS_SET);
         }
         else {
             gpx->target.position.y = (gpx->command.y + userOffset.y) * userScale;
@@ -2915,7 +3038,7 @@ static int calculate_target_position(Gpx *gpx, Ptr5d delta, int *relative)
         if(gpx->flag.relativeCoordinates) {
             delta->z = gpx->command.z * userScale;
             gpx->target.position.z += delta->z;
-            *relative = !!(gpx->axis.positionKnown & Z_IS_SET);
+            *relative |= !!(gpx->axis.positionKnown & Z_IS_SET);
         }
         else {
             gpx->target.position.z = (gpx->command.z + userOffset.z) * userScale;
@@ -3170,6 +3293,7 @@ EepromType eepromTypeFromTypeName(char *type_name)
 
 // PARSER PRE-PROCESSOR
 
+#ifdef FUTURE
 // return the length of the given file in bytes
 
 static long get_filesize(FILE *file)
@@ -3180,6 +3304,7 @@ static long get_filesize(FILE *file)
     fseek(file, 0L, SEEK_SET);
     return filesize;
 }
+#endif // FUTURE
 
 // clean up the gcode command for processing
 
@@ -3268,8 +3393,8 @@ static char *normalize_comment(char *p) {
  GCODE_FLAVOR:= S+ ('makerbot' | 'reprap')
  */
 
-#define MACRO_IS(token) strcmp(token, macro) == 0
-#define NAME_IS(n) strcasecmp(name, n) == 0
+#define MACRO_IS(token) (strcasecmp(token, macro) == 0)
+#define NAME_IS(n) (strcasecmp(name, n) == 0)
 
 static int parse_macro(Gpx *gpx, const char* macro, char *p)
 {
@@ -3573,6 +3698,7 @@ static int parse_macro(Gpx *gpx, const char* macro, char *p)
         if(gpx->flag.pausePending && gpx->flag.runMacros) {
             CALL( pause_at_zpos(gpx, gpx->commandAt[0].z) );
             gpx->flag.pausePending = 0;
+            VERBOSE( gcodeResult(gpx, "Issued next pause @ %0.2lf\n", z) );
         }
         gpx->flag.macrosEnabled = 1;
     }
@@ -3587,6 +3713,12 @@ static int parse_macro(Gpx *gpx, const char* macro, char *p)
         // REVIEW can't be both header and footer at the same time, so I don't
         // think this can ever be executed, what was it supposed to be for?
         gpx->flag.macrosEnabled = 0;
+    }
+    else if(MACRO_IS("open_start_gcode") || MACRO_IS("open_end_gcode")) {
+        gpx->flag.macrosEnabled = 0;
+    }
+    else if(MACRO_IS("close_start_gcode") || MACRO_IS("close_end_gcode")) {
+        gpx->flag.macrosEnabled = 1;
     }
     // ;@load_eeprom_map
     // Load the appropriate built-in eeprom map for the firmware flavor and version
@@ -3697,8 +3829,25 @@ static int parse_macro(Gpx *gpx, const char* macro, char *p)
             gcodeResult(gpx, "current.percent: %d\%\n", gpx->current.percent);
             gcodeResult(gpx, "total.time: %lf\n", gpx->total.time);
         }
+        // @debug overheat
+        // generate an overheat failure result
         else if(NAME_IS("overheat")) {
             return 0x8B;
+        }
+        // @debug verboseon
+        // turn on verboseMode
+        else if(NAME_IS("verboseon")) {
+            gpx->flag.verboseMode = 1;
+        }
+        // @debug verboseoff
+        // turn off verboseMode
+        else if(NAME_IS("verboseoff")) {
+            gpx->flag.verboseMode = 0;
+        }
+        // @debug iostatus
+        // pass to io callback to output i/o state
+        else if(NAME_IS("iostatus")) {
+            gcodeResult(gpx, "@iostatus");
         }
     }
     return SUCCESS;
@@ -3938,6 +4087,8 @@ done:
      return iret;
 }
 
+int gpx_parse_steps_per_mm_all_axes(Gpx *gpx, char *parm);
+
 int gpx_set_property_inner(Gpx *gpx, const char* section, const char* property, char* value)
 {
     int rval;
@@ -4081,6 +4232,9 @@ int gpx_set_property_inner(Gpx *gpx, const char* section, const char* property, 
             gpx->axis.mask = gpx->machine.extruder_count == 1 ? (XYZ_BIT_MASK | A_IS_SET) : AXES_BIT_MASK;;
         }
         else if(PROPERTY_IS("timeout")) gpx->machine.timeout = atoi(value);
+        else if(PROPERTY_IS("steps_per_mm")) {
+            gpx_parse_steps_per_mm_all_axes(gpx, value);
+        }
         else goto SECTION_ERROR;
     }
     else {
@@ -4092,6 +4246,33 @@ int gpx_set_property_inner(Gpx *gpx, const char* section, const char* property, 
 SECTION_ERROR:
     gcodeResult(gpx, "(line %u) Configuration error: [%s] section contains unrecognised property %s = %s" EOL, gpx->lineNumber, section, property, value);
     return gpx->lineNumber;
+}
+
+// parse a steps per mm parameter of the form x88.9y88.9z94.5a102.4b105.7
+int gpx_parse_steps_per_mm_all_axes(Gpx *gpx, char *parm)
+{
+    if(parm == NULL)
+        return SUCCESS;
+
+    char *s = parm;
+    char axis = *s;
+
+    while(*s++) {
+        if (isdigit(*s)) {
+            double steps = strtod(s, &s);
+            switch(tolower(axis)) {
+                case 'x': gpx->machine.x.steps_per_mm = steps; break;
+                case 'y': gpx->machine.y.steps_per_mm = steps; break;
+                case 'z': gpx->machine.z.steps_per_mm = steps; break;
+                case 'a': gpx->machine.a.steps_per_mm = steps; break;
+                case 'b': gpx->machine.b.steps_per_mm = steps; break;
+                default:
+                    gcodeResult(gpx, "(line %u) Configuration error: steps per mm parameter (%s) contains unrecognized axis '%c'\n", gpx->lineNumber, parm, axis);
+            }
+        }
+        axis = *s;
+    }
+    return SUCCESS;
 }
 
 int gpx_load_config(Gpx *gpx, const char *filename)
@@ -4190,6 +4371,8 @@ static int get_extruder_temperature_extended(Gpx *gpx)
 {
     int rval;
 
+    // Warning: The tio callback handler depends on this call order
+    CALL(get_build_statistics(gpx));
     CALL(get_extruder_temperature(gpx, 0));
     CALL(get_extruder_target_temperature(gpx, 0));
     if(gpx->machine.extruder_count > 1) {
@@ -4204,6 +4387,7 @@ static int get_extruder_temperature_extended(Gpx *gpx)
         CALL(get_build_platform_temperature(gpx, 1));
         CALL(get_build_platform_target_temperature(gpx, 1));
     }
+    empty_frame(gpx);
     return SUCCESS;
 }
 
@@ -4467,6 +4651,10 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 // G0 - Rapid Positioning
             case 0: {
                 double feedrate = 0.0;
+
+                if(!gpx->flag.relativeCoordinates && gpx->flag.ignoreAbsoluteMoves)
+                    break;
+
                 CALL( calculate_target_position(gpx, &delta, &relative) );
                 if(!(gpx->command.flag & F_IS_SET)) {
                     if(gpx->command.flag & X_IS_SET) delta.x = fabs(delta.x);
@@ -4502,6 +4690,8 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
 
                 // G1 - Coordinated Motion
             case 1:
+                if(!gpx->flag.relativeCoordinates && gpx->flag.ignoreAbsoluteMoves)
+                    break;
                 CALL( calculate_target_position(gpx, &delta, &relative) );
                 CALL( queue_ext_point(gpx, 0.0, &delta, relative) );
                 update_current_position(gpx);
@@ -4572,8 +4762,12 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 }
                 break;
 
-                // G21 - Use Milimeters as Units (IGNORED)
-                // G71 - Use Milimeters as Units (IGNORED)
+                // G15 - Use cartesian coordinates
+            case 15:
+                break;  // yep, it's all we do, currently
+
+                // G21 - Use Millimeters as Units (IGNORED)
+                // G71 - Use Millimeters as Units (IGNORED)
             case 21:
             case 71:
                 break;
@@ -4630,7 +4824,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                     }
                 }
                 command_emitted++;
-                gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+                set_unknown_axes(gpx, gpx->command.flag);
                 gpx->excess.a = 0;
                 gpx->excess.b = 0;
                 break;
@@ -4683,6 +4877,9 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
 
                 // G92 - Define current position on axes
             case 92: {
+                if(gpx->command.flag & XYZ_BIT_MASK) {
+                    gpx->flag.ignoreAbsoluteMoves = 0;
+                }
                 double userScale = gpx->flag.macrosEnabled ? gpx->user.scale : 1.0;
                 if(gpx->command.flag & X_IS_SET) gpx->current.position.x = gpx->command.x * userScale;
                 if(gpx->command.flag & Y_IS_SET) gpx->current.position.y = gpx->command.y * userScale;
@@ -4733,7 +4930,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 CALL( home_axes(gpx, gpx->command.flag & XYZ_BIT_MASK, ENDSTOP_IS_MIN) );
                 command_emitted++;
                 // clear homed axes
-                gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+                set_unknown_axes(gpx, gpx->command.flag);
                 gpx->excess.a = 0;
                 gpx->excess.b = 0;
                 break;
@@ -4743,7 +4940,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 CALL( home_axes(gpx, gpx->command.flag & XYZ_BIT_MASK, ENDSTOP_IS_MAX) );
                 command_emitted++;
                 // clear homed axes
-                gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);
+                set_unknown_axes(gpx, gpx->command.flag);
                 gpx->excess.a = 0;
                 gpx->excess.b = 0;
                 break;
@@ -4995,6 +5192,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                                 if(gpx->flag.pausePending && gpx->flag.runMacros) {
                                     CALL( pause_at_zpos(gpx, gpx->commandAt[0].z) );
                                     gpx->flag.pausePending = 0;
+                                    VERBOSE( gcodeResult(gpx, "Issued next pause @ %0.2lf\n", gpx->commandAt[0].z) );
                                 }
                                 gpx->flag.macrosEnabled = 1;
                             }
@@ -5046,7 +5244,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 // M103 - Turn extruder off
             case 103:
                 if(gpx->flag.dittoPrinting) {
-                    CALL( set_steppers(gpx, A_IS_SET|B_IS_SET, 1) );
+                    CALL( set_steppers(gpx, A_IS_SET|B_IS_SET, 0) );
                     command_emitted++;
                     gpx->tool[A].motor_enabled = gpx->tool[B].motor_enabled = 0;
                 }
@@ -5177,7 +5375,6 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 break;
 
                 // M108 - Set extruder motor 5D 'simulated' RPM
-                // toolchange for ReplicatorG
             case 108:
 #if ENABLE_SIMULATED_RPM
                 if(gpx->command.flag & R_IS_SET) {
@@ -5191,11 +5388,16 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 else
 #endif
                 if(gpx->command.flag & T_IS_SET) {
+                    // M108 - toolchange for ReplicatorG
                     if(!gpx->flag.dittoPrinting && gpx->target.extruder != gpx->current.extruder) {
                         int timeout = gpx->command.flag & P_IS_SET ? (int)gpx->command.p : MAX_TIMEOUT;
                         CALL( do_tool_change(gpx, timeout) );
                         command_emitted++;
                     }
+                }
+                else if(gpx->flag.sioConnected) {
+                    // M108 - cancel heating for Marlin
+                    CALL( abort_immediately(gpx) );
                 }
 #if ENABLE_SIMULATED_RPM
                 else {
@@ -5289,7 +5491,6 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 if(gpx->machine.a.has_heated_build_platform || gpx->machine.b.has_heated_build_platform) {
                     if(gpx->command.flag & S_IS_SET) {
                         unsigned temperature = (unsigned)gpx->command.s;
-                        if(temperature > HBP_MAX) temperature = HBP_MAX;
                         unsigned tool_id = gpx->machine.a.has_heated_build_platform ? A : B;
                         if(gpx->command.flag & T_IS_SET) {
                             tool_id = gpx->target.extruder;
@@ -5307,7 +5508,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                         }
                     }
                     else {
-                        gcodeResult(gpx, "(line %u) Syntax error: M%u is missing temperature, use Sn where n is 0-120" EOL, gpx->lineNumber, gpx->command.m);
+                        gcodeResult(gpx, "(line %u) Syntax error: M%u is missing temperature, use Sn where n is 0-130" EOL, gpx->lineNumber, gpx->command.m);
                     }
                 }
                 else {
@@ -5326,6 +5527,11 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 // M114 - Get current position
             case 114:
                 CALL( get_extended_position(gpx) );
+                break;
+
+                // M115 - Get firmware version and capabilities
+            case 115:
+                CALL( get_advanced_version_number(gpx) );
                 break;
 
                 // M126 - Turn blower fan on (valve open)
@@ -5370,10 +5576,13 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 // M132 - Load Current Position from EEPROM
             case 132:
                 if(gpx->command.flag & AXES_BIT_MASK) {
+                    if(gpx->command.flag & XYZ_BIT_MASK) {
+                        gpx->flag.ignoreAbsoluteMoves = 0;
+                    }
                     CALL( recall_home_positions(gpx) );
                     command_emitted++;
                     // clear loaded axes
-                    gpx->axis.positionKnown &= ~(gpx->command.flag & gpx->axis.mask);;
+                    set_unknown_axes(gpx, gpx->command.flag);
                     gpx->excess.a = 0;
                     gpx->excess.b = 0;
 
@@ -5438,7 +5647,6 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                 if(gpx->machine.a.has_heated_build_platform || gpx->machine.b.has_heated_build_platform) {
                     if(gpx->command.flag & S_IS_SET) {
                         unsigned temperature = (unsigned)gpx->command.s;
-                        if(temperature > HBP_MAX) temperature = HBP_MAX;
                         unsigned tool_id = gpx->machine.a.has_heated_build_platform ? A : B;
                         if(gpx->command.flag & T_IS_SET) {
                             tool_id = gpx->target.extruder;
@@ -5563,12 +5771,18 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
                     else {
                         double z = gpx->flag.relativeCoordinates ? (gpx->current.position.z + gpx->command.z) : (gpx->command.z + conditional_z);
                         CALL( pause_at_zpos(gpx, z) );
+                        VERBOSE( gcodeResult(gpx, "Issued pause @ %0.2lf\n", z) );
                     }
                 }
                 else {
                     gcodeResult(gpx, "(line %u) Syntax warning: M322 is missing Z axis" EOL, gpx->lineNumber);
                 }
                 command_emitted++;
+                break;
+
+                // M400 - Wait for current moves to finish
+            case 400:
+                empty_frame(gpx);
                 break;
 
                 // M420 - Set RGB LED value (REB - P)
@@ -5596,7 +5810,7 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
     }
     // X,Y,Z,A,B,E,F
     else if(gpx->command.flag & (AXES_BIT_MASK | F_IS_SET)) {
-        if(!(gpx->command.flag & COMMENT_IS_SET)) {
+        if(!(gpx->command.flag & COMMENT_IS_SET) && (gpx->flag.relativeCoordinates || !gpx->flag.ignoreAbsoluteMoves)) {
             CALL( calculate_target_position(gpx, &delta, &relative) );
             CALL( queue_ext_point(gpx, 0.0, &delta, relative) );
             update_current_position(gpx);
@@ -6125,14 +6339,6 @@ static void read_query_response(Gpx *gpx, Sio *sio, unsigned command, char *buff
     }
 }
 
-// 02 - Get available buffer size
-
-char buffer_size_query[] = {
-    0xD5,   // start byte
-    1,      // length
-    2,      // query command
-    0       // crc
-};
 
 #if defined(_WIN32) || defined(_WIN64)
 // windows has more simultaneous timeout values, so we don't need select
@@ -6167,7 +6373,7 @@ int port_handler(Gpx *gpx, Sio *sio, char *buffer, size_t length)
         size_t bytes;
         int retry_count = 0;
         do {
-            VERBOSESIO( fprintf(gpx->log, "port_handler write: %zu" EOL, length) );
+            VERBOSESIO( fprintf(gpx->log, "port_handler write: %lu" EOL, (unsigned long)length) );
             VERBOSESIO( hexdump(gpx->log, buffer, length) );
             // send the packet
             if((bytes = write(sio->port, buffer, length)) == -1) {
@@ -6243,29 +6449,49 @@ int port_handler(Gpx *gpx, Sio *sio, char *buffer, size_t length)
 
                     // 0x82 - Action buffer overflow, entire packet discarded
                 case 0x82:
-		{
+                    VERBOSE( fprintf(gpx->log, "(retry %u) Action buffer overflow\n", retry_count) );
                     if(!sio->flag.retryBufferOverflow)
                         goto L_ABORT;
-#ifdef HAS_NANOSLEEP
-// mingw32 cross compiler lacks nanosleep()
-// mingw32 env. on Windows has nanosleep()
-		    struct timespec ts = {0, 100000000}; // 0.1 s
-#endif
+
+                    // first, harass the bot in a tight loop in case we're
+                    // doing lots of short movements. On the one hand, we're
+                    // making it worse by making the bot take time on serial
+                    // i/o. On the other hand we want to make sure we send the
+                    // next command into the buffer as soon as possible so we
+                    // don't get a zit because of a sleep on our side
+                    //
+                    // twenty times, check for room every 10ms
+                    int i;
+                    for(i = 0; i < 20; i++) {
+                        short_sleep(NS_10MS);
+
+                        // query buffer size
+                        CALL( port_handler(gpx, sio, buffer_size_query, 4) );
+
+                        // if we now have room, let's go again
+                        if (sio->response.bufferSize >= length)
+                            goto L_REPEATSEND;
+                    }
+
+                    if(sio->flag.shortRetryBufferOverflowOnly) {
+                        rval = 0x82; // recursion cleared it, put it back
+                        goto L_ABORT;
+                    }
+
+                    // now, wait until we've got room for the command, checking
+                    // every 1/10 second
                     do {
-                        // wait for 1/10 seconds
-#ifdef HAS_NANOSLEEP
-			nanosleep(&ts, NULL);
-#else
-			usleep(100000);
-#endif
+                        short_sleep(NS_100MS);
                         // query buffer size
                         buffer_size_query[3] = calculate_crc((unsigned char *)buffer_size_query + 2, 1);
                         CALL( port_handler(gpx, sio, buffer_size_query, 4) );
+                        i++;
                         // loop until buffer has space for the next command
                     } while(sio->response.bufferSize < length);
+L_REPEATSEND:
+                    VERBOSE( fprintf(gpx->log, "(%u) Query buffer size: %u\n", i, sio->response.bufferSize) );
                     // we just did all the waiting we needed, skip the 2 second timeout
                     continue;
-		}
 
                     // 0x83 - CRC mismatch, packet discarded. (retry)
                 case 0x83:
@@ -6317,7 +6543,7 @@ int port_handler(Gpx *gpx, Sio *sio, char *buffer, size_t length)
             }
 L_RETRY:
             // wait for 2 seconds
-            sleep(2);
+            long_sleep(2);
         } while(++retry_count < 5);
     }
 
@@ -6335,6 +6561,7 @@ int gpx_convert_and_send(Gpx *gpx, FILE *file_in, int sio_port,
     sio.bytes_out = 0;
     sio.bytes_in = 0;
     sio.flag.retryBufferOverflow = 1;
+    sio.flag.shortRetryBufferOverflowOnly = 0;
     int logMessages = gpx->flag.logMessages;
 
     if(file_in && file_in != stdin) {

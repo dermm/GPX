@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#include "portable_endian.h"
 #include "s3g_private.h"
 #include "s3g_stdio.h"
 #include "s3g.h"
@@ -312,7 +313,7 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
      if (!ctx || !buf || maxbuf == 0)
      {
 	  fprintf(stderr, "s3g_command_get(%d): Invalid call; ctx=%p, buf=%p, "
-		  "maxbuf=%lu\n", __LINE__, (void *)ctx, (void *)buf, maxbuf);
+		  "maxbuf=%lu\n", __LINE__, (void *)ctx, (void *)buf, (unsigned long)maxbuf);
 	  errno = EINVAL;
 	  return(-1);
      }
@@ -375,6 +376,7 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
 	  memcpy(&f32.u.c, buf, 4); \
 	  buf    += bytes_read; \
 	  maxbuf -= bytes_read; \
+	  f32.u.u = le32toh(f32.u.u); \
 	  cmd->t.v = f32.u.i
 
 #define GET_UINT32(v) \
@@ -384,7 +386,7 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
 	  memcpy(&f32.u.c, buf, 4); \
 	  buf    += bytes_read; \
 	  maxbuf -= bytes_read; \
-	  cmd->t.v = f32.u.u
+	  cmd->t.v = le32toh(f32.u.u)
 
 #define GET_FLOAT32(v) \
 	  if (maxbuf < 4) goto trunc; \
@@ -393,6 +395,7 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
 	  memcpy(&f32.u.c, buf, 4); \
 	  buf    += bytes_read; \
 	  maxbuf -= bytes_read; \
+	  f32.u.u = le32toh(f32.u.u); \
 	  cmd->t.v = f32.u.f;
 
 #define GET_UINT8(v) \
@@ -411,6 +414,7 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
 	  memcpy(&f16.u.c, buf, 2); \
 	  buf    += bytes_read; \
 	  maxbuf -= bytes_read; \
+	  f16.u.u = le16toh(f16.u.u); \
 	  cmd->t.v = f16.u.i
 
 #define GET_UINT16(v) \
@@ -420,7 +424,7 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
 	  memcpy(&f16.u.c, buf, 2); \
 	  buf    += bytes_read; \
 	  maxbuf -= bytes_read; \
-	  cmd->t.v = f16.u.u
+	  cmd->t.v = le16toh(f16.u.u)
 
 #define ZERO(v,c) cmd->t.v = (c)0
 
@@ -483,9 +487,10 @@ int s3g_command_read_ext(s3g_context_t *ctx, s3g_command_t *cmd,
 
 	  if (cmd->t.tool.subcmd_len == 1)
 	       cmd->t.tool.subcmd_value = (uint16_t)buf[3];
-	  else if (cmd->t.tool.subcmd_len > 1)
+	  else if (cmd->t.tool.subcmd_len > 1) {
 	       memcpy((void *)&cmd->t.tool.subcmd_value, buf + 3, sizeof(uint16_t));
-	  else
+	       cmd->t.tool.subcmd_value = le16toh(cmd->t.tool.subcmd_value);
+	  } else
 	       cmd->t.tool.subcmd_value = 0;
 
 	  maxbuf -= 3 + bytes_read;

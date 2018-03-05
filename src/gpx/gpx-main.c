@@ -29,35 +29,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
-#if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
-#endif
-
-#if defined(SERIAL_SUPPORT)
-#if !defined(_WIN32) && !defined(_WIN64)
-#include <termios.h>
-#else
-#include "winsio.h"
-#endif
-#define USE_GPX_SIO_OPEN
-#else
-typedef long speed_t;
-#define B115200 115200
-#define B57600  57600
-#define NO_SERIAL_SUPPORT_MSG "Serial I/O and USB printing is not supported " \
-     "by this build of GPX"
-#endif
-
-#if defined(_WIN32) || defined(_WIN64)
-#include "getopt_.h"
-// strcasecmp() is not provided on Windows
-// _stricmp() is equivalent but may require <string.h>
-#define strcasecmp _stricmp
-#endif
 
 #include "gpx.h"
-#include "config.h"
+#include "machine_config.h"
 
 // Global variables
 
@@ -74,19 +51,20 @@ static char temp_config_name[24];
 static void exit_handler(void)
 {
     // close open files
-    if(file_in != stdin) {
+    if(file_in != stdin && file_in != NULL) {
         fclose(file_in);
-        if(file_out != stdout) {
-            if(ferror(file_out)) {
-                perror("Error writing to output file");
-            }
-            fclose(file_out);
-	    file_out = NULL;
+        file_in = NULL;
+    }
+    if(file_out != stdout && file_out != NULL) {
+        if(ferror(file_out)) {
+            perror("Error writing to output file");
         }
-        if(file_out2) {
-            fclose(file_out2);
-	    file_out2 = NULL;
-        }
+        fclose(file_out);
+        file_out = NULL;
+    }
+    if(file_out2 != NULL) {
+        fclose(file_out2);
+        file_out2 = NULL;
     }
 
     // 23 February 2015
@@ -123,7 +101,7 @@ static void usage(int err)
     if (err)
         fputs(EOL, fp);
 
-    fputs("GPX " GPX_VERSION EOL, fp);
+    fputs("GPX " PACKAGE_VERSION EOL, fp);
     fputs("Copyright (c) 2013 WHPThomas, All rights reserved." EOL, fp);
 
     fputs("Additional changes Copyright (c) 2014, 2015 DNewman, MWalker" EOL, fp);
@@ -145,16 +123,22 @@ static void usage(int err)
     fputs("GNU General Public License for more details." EOL, fp);
 
     fputs(EOL "Usage:" EOL, fp);
-    fputs("gpx [-CFdgilpqr" SERIAL_MSG1 "tvw] " SERIAL_MSG2 "[-b BAUDRATE] [-c CONFIG] [-e EEPROM] [-f DIAMETER] [-m MACHINE] [-N h|t|ht] [-n SCALE] [-x X] [-y Y] [-z Z] IN [OUT]" EOL, fp);
+    fputs("gpx [-CFIdgilpqr" SERIAL_MSG1 "tvw] " SERIAL_MSG2 "[-L LOGFILE] [-D NEWPORT] [-E EXISTINGPORT] [-c CONFIG] [-e EEPROM] [-f DIAMETER] [-m MACHINE] [-N h|t|ht] [-n SCALE] [-x X] [-y Y] [-z Z] [-W S] IN [OUT]" EOL, fp);
     fputs(EOL "Options:" EOL, fp);
-    fputs("\t-C\tCreate temporary file with a copy of the machine configuration" EOL, fp);
+    fputs("\t-C\tcreate temporary file with a copy of the machine configuration" EOL, fp);
+    fputs("\t-D\trun in daemon mode and create the named virtual port" EOL, fp);
+    fputs("\t-E\trun in daemon mode and open the named psuedo-terminal" EOL, fp);
     fputs("\t-F\twrite X3G on-wire framing data to output file" EOL, fp);
-    fputs("\t-N\tDisable writing of the X3G header (start build notice)," EOL, fp);
+    fputs("\t-I\tignore default .ini files" EOL, fp);
+    fputs("\t-N\tdisable writing of the X3G header (start build notice)," EOL, fp);
     fputs("\t  \ttail (end build notice), or both" EOL, fp);
+	fputs("\t-W\twait S seconds after opening the serial connection" EOL, fp);
+	fputs("\t  \tbefore reading or writing (default is 2 seconds)" EOL, fp);
     fputs("\t-d\tsimulated ditto printing" EOL, fp);
     fputs("\t-g\tMakerbot/ReplicatorG GCODE flavor" EOL, fp);
     fputs("\t-i\tenable stdin and stdout support for command line pipes" EOL, fp);
     fputs("\t-l\tlog to file" EOL, fp);
+    fputs("\t-L\tlog to named [LOGFILE] file" EOL, fp);
     fputs("\t-p\toverride build percentage" EOL, fp);
     fputs("\t-q\tquiet mode" EOL, fp);
     fputs("\t-r\tReprap GCODE flavor" EOL, fp);
@@ -162,7 +146,7 @@ static void usage(int err)
     fputs("\t-s\tenable USB serial I/O and send x3G output to 3D printer" EOL, fp);
 #endif
     fputs("\t-t\ttruncate filename (DOS 8.3 format)" EOL, fp);
-    fputs("\t-v\tverose mode" EOL, fp);
+    fputs("\t-v\tverbose mode" EOL, fp);
     fputs("\t-w\trewrite 5d extrusion values" EOL, fp);
 #if defined(SERIAL_SUPPORT)
     fputs(EOL "BAUDRATE: the baudrate for serial I/O (default is 115200)" EOL, fp);
@@ -218,6 +202,7 @@ int gpx_sio_open(Gpx *gpx, const char *filename, speed_t baud_rate,
     if(sio_port)
 	 *sio_port = -1;
 
+    fprintf(gpx->log, "Opening port: %s.\n", filename);
     // open and configure the serial port
     if((port = open(filename, O_RDWR | O_NOCTTY | O_NONBLOCK)) < 0) {
         perror("Error opening port");
@@ -230,6 +215,7 @@ int gpx_sio_open(Gpx *gpx, const char *filename, speed_t baud_rate,
     }
 
     if(tcgetattr(port, &tp) < 0) {
+        fprintf(stderr, "errno = %d", errno);
         perror("Error getting port attributes");
 	return 0;
     }
@@ -279,7 +265,9 @@ int gpx_sio_open(Gpx *gpx, const char *filename, speed_t baud_rate,
 	return 0;
     }
 
-    sleep(2);
+    if(gpx->open_delay > 0) {
+		sleep(gpx->open_delay);
+	}
     if(tcflush(port, TCIOFLUSH) < 0) {
         perror("Error flushing port");
 	return 0;
@@ -355,20 +343,21 @@ int main(int argc, char * const argv[])
 {
     int c, i, rval = 1;
     int force_framing = 0;
+    int ignore_default_ini = 0;
     int log_to_file = 0;
     int standard_io = 0;
     int serial_io = 0;
     int truncate_filename = 0;
+    char *daemon_port = NULL;
     char *config = NULL;
     char *eeprom = NULL;
     double filament_diameter = 0;
-    char *buildname = "GPX " GPX_VERSION;
-#ifdef _WIN32
-    char *otherdelim = NULL;
-#endif
+    char *buildname = PACKAGE_STRING;
+    char *logname = NULL;
     char *filename;
     speed_t baud_rate = B115200;
     int make_temp_config = 0;
+    int create_daemon_port = 0;
 
     // Blank the temporary config file name.  If it isn't blank
     //   on exit and an error has occurred, then it is deleted
@@ -382,17 +371,40 @@ int main(int argc, char * const argv[])
     atexit(exit_handler);
 
     gpx_initialize(&gpx, 1);
+    gpx.log = stderr;
 
-    // peek at first option in case we want verbose for reading gpx.ini
-    if (argc > 1 && argv[1][0] && argv[1][1] == 'v')
-        gpx.flag.verboseMode = 1;
+    // we run through getopt twice, the first time is to figure out whether to load
+    // the ini file from the default locations and whether to be verbose about it
+    // we need to load the ini file before parsing the rest so that the command line
+    // overrides the default ini in the standard case
+    while ((c = getopt(argc, argv, "CD:E:FIL:N:W:b:c:de:gf:ilm:n:pqrstu:vwx:y:z:?")) != -1) {
+        switch (c) {
+            case 'I':
+                ignore_default_ini = 1;
+                break;
+            case 'l':
+                gpx.flag.verboseMode = 1;
+                // fallthrough
+            case 'L': // does not imply verbose unlike -l
+                log_to_file = 1;
+                break;
+            case 'v':
+                if(gpx.flag.verboseMode)
+                    gpx.flag.verboseSioMode = 1;
+                gpx.flag.verboseMode = 1;
+                break;
+        }
+    }
+    optind = 1;
 
-    // READ GPX.INI
-    i = gpx_find_ini(&gpx, argv[0]);
-    if (i > 0) {
-        fprintf(stderr, "(line %u) Configuration syntax error: unrecognised parameters" EOL, i);
-        usage(1);
-        goto done;
+    if(!ignore_default_ini) {
+        // READ GPX.INI
+        i = gpx_find_ini(&gpx, argv[0]);
+        if (i > 0) {
+            fprintf(stderr, "(line %u) Configuration syntax error: unrecognised parameters" EOL, i);
+            usage(1);
+            goto done;
+        }
     }
 
     // READ COMMAND LINE
@@ -402,16 +414,40 @@ int main(int argc, char * const argv[])
     // error message should they be attempted when the code
     // is compiled without serial I/O support.
 
-    while ((c = getopt(argc, argv, "CFN:b:c:de:gf:ilm:n:pqrstuvwx:y:z:?")) != -1) {
+    while ((c = getopt(argc, argv, "CD:E:FIL:N:W:b:c:de:gf:ilm:n:pqrstu:vwx:y:z:?")) != -1) {
         switch (c) {
 	    case 'C':
 		 // Write config data to a temp file
 		 // Write output to stdout
 		 make_temp_config = 1;
 		 break;
+            case 'D':
+                 create_daemon_port = 1;
+                 // fallthrough
+            case 'E':
+                 //
+                 // Run in daemon mode - implies serial mode to the printer and
+                 // then gcode input and reprap responses to other processes are
+                 // via a two-way pipe to emulate a RepRap printer on the specified
+                 // port
+                 daemon_port = optarg;
+#if !defined(SERIAL_SUPPORT)
+                 fprintf(stderr, NO_SERIAL_SUPPORT_MSG EOL);
+                 usage(1);
+                 goto done;
+#else
+                 serial_io = 1;
+                 gpx.flag.framingEnabled = 1;
+#endif
+                break;
 	    case 'F':
 		 force_framing = ITEM_FRAMING_ENABLE;
 		 break;
+            case 'I':
+                 break; // handled in first getopt loop
+            case 'L':
+                logname = optarg;
+                break;
 	    case 'N':
 		 if(optarg[0] == 'h' || optarg[1] == 'h')
 		      gpx_set_start(&gpx, 0);
@@ -464,7 +500,7 @@ int main(int argc, char * const argv[])
                 // fall through
             case 's':
 #if !defined(SERIAL_SUPPORT)
-		 fprintf(stderr, NO_SERIAL_SUPPORT_MSG EOL);
+		fprintf(stderr, NO_SERIAL_SUPPORT_MSG EOL);
 		usage(1);
 		goto done;
 #else
@@ -495,9 +531,7 @@ int main(int argc, char * const argv[])
                 standard_io = 1;
                 break;
             case 'l':
-                gpx.flag.verboseMode = 1;
-                log_to_file = 1;
-                break;
+                break; // handled in first getopt loop
             case 'm':
                 if(gpx_set_property(&gpx, "printer", "machine_type", optarg)) {
                     usage(1);
@@ -520,11 +554,13 @@ int main(int argc, char * const argv[])
                 truncate_filename = 1;
                 break;
             case 'u':
-                gpx.flag.verboseSioMode = 1;
+                if(gpx_set_property(&gpx, "machine", "steps_per_mm", optarg)) {
+                    usage(1);
+                    goto done;
+                }
                 break;
             case 'v':
-                gpx.flag.verboseMode = 1;
-                break;
+                break; // handled in first getopt loop
             case 'w':
                 gpx.flag.rewrite5D = 1;
                 break;
@@ -536,6 +572,9 @@ int main(int argc, char * const argv[])
                 break;
             case 'z':
                 gpx.user.offset.z = strtod(optarg, NULL);
+                break;
+            case 'W':
+                gpx.open_delay = strtod(optarg, NULL);
                 break;
             case '?':
 		usage(0);
@@ -552,7 +591,7 @@ int main(int argc, char * const argv[])
 
     // LOG TO FILE
 
-    if(log_to_file && argc > 0) {
+    if(log_to_file && logname == NULL && argc > 0) {
         filename = (argc > 1 && !serial_io) ? argv[1] : argv[0];
         // or use the input filename with a .log extension
         char *dot = strrchr(filename, '.');
@@ -573,11 +612,15 @@ int main(int argc, char * const argv[])
         *filename++ = 'g';
         *filename++ = '\0';
         filename = gpx.buffer.out;
+        logname = filename;
+    }
 
-        if((gpx.log = fopen(filename, "w+")) == NULL) {
+    if(logname != NULL) {
+        if((gpx.log = fopen(logname, "w+")) == NULL) {
             gpx.log = stderr;
             perror("Error opening log");
         }
+        fprintf(gpx.log, "GPX started.\n");
     }
 
     // READ CONFIGURATION
@@ -627,7 +670,29 @@ int main(int argc, char * const argv[])
 
     // OPEN FILES AND PORTS FOR INPUT AND OUTPUT
 
-    if(standard_io) {
+    if(daemon_port != NULL) {
+        if(standard_io) {
+            fprintf(stderr, "Command line error: daemon mode incompatible with standard i/o\n");
+            usage(1);
+            goto done;
+        }
+        if(argc == 0) {
+            fprintf(stderr, "Command line error: port required for serial I/O in daemon mode\n");
+            usage(1);
+            goto done;
+        }
+
+        // create the bi-directional virtual port for other processes
+        // and read and write from there until somebody tells us to quit
+        gpx_daemon(&gpx, create_daemon_port, daemon_port, argv[0], baud_rate);
+        goto done;
+    }
+    else if(standard_io) {
+        if(daemon_port != NULL) {
+            fprintf(stderr, "Using standard in/out is incompatible with daemon mode\n");
+            usage(1);
+            goto done;
+        }
         if(serial_io) {
             if(argc > 0) {
                 filename = argv[0];
