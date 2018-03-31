@@ -1583,6 +1583,7 @@ static int set_valve(Gpx *gpx, unsigned extruder_id, unsigned state)
         write_8(gpx, 1);
 
         // uint8: 1 to enable, 0 to disable
+		// and 0 to 255 when fan_pwm is enabled or 0 to 100 when fan_pwm and fan_pwm_percent is enabled
         write_8(gpx, state);
 
         return end_frame(gpx);
@@ -5536,7 +5537,19 @@ int gpx_convert_line(Gpx *gpx, char *gcode_line)
 
                 // M126 - Turn blower fan on (valve open)
             case 126: {
+#define fan_pwm
+#ifdef fan_pwm	// Support to forward the S value to printer
+				int state = 255; // When S is not set, the Fan must be on
+				if (gpx->command.flag & S_IS_SET) {
+					state =  gpx->command.s;
+				}
+#define fan_pwm_percent
+#ifdef fan_pwm_percent // If the printer firmware wants to have the value in percent
+				state = (float)state / 2.55f; // example: gcode is S153 then 60% sends to printer
+#endif
+#else			// Without support the state is 1 or 0
                 int state = (gpx->command.flag & S_IS_SET) ? ((unsigned)gpx->command.s ? 1 : 0) : 1;
+#endif
                 if(gpx->flag.dittoPrinting) {
                     CALL( set_valve(gpx, B, state) );
                     CALL( set_valve(gpx, A, state) );
